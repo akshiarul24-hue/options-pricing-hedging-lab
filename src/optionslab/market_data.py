@@ -133,41 +133,95 @@ def clean_quotes(df, max_rel_spread=0.30, min_bid=0.05, use_last_if_no_quotes=Tr
     return pd.concat(out, ignore_index=True) if out else df.iloc[0:0]
 
 
-def estimate_forward(quotes_one_expiry, spot, window=0.06, min_pairs=4):
+def estimate_forward(quotes_one_expiry, spot, window=0.06, min_pairs=4,
+                     rate_bounds=(-0.01, 0.12), fallback_rate=None):
     """Forward F and discount factor DF from put-call parity, C - P = DF (F - K).
 
     Uses strikes within `window` (e.g. 6%) of spot where both a call and a put
-    are quoted. Returns (F, DF, n_pairs).
+    are quoted, and fits the line robustly: pairs whose residual is more than
+    3 robust standard deviations (MAD-based) from the fit are dropped and the
+    line is refit. Stale or mismatched quotes are common in free data, and a
+    single bad pair can tilt an ordinary least-squares slope a lot.
+
+    Sanity check: the slope implies an interest rate, r = -ln(DF) / T. If it is
+    outside `rate_bounds` the slope is not trustworthy (with a short expiry, a
+    tiny slope error means a huge rate error). Then, if `fallback_rate` is
+    given, DF is set from that rate and F is taken as the median of
+    K + (C - P) / DF over the clean pairs; otherwise a ValueError is raised.
+
+    Returns (F, DF, n_pairs_used).
     """
     q = quotes_one_expiry
-    calls = q[q["type"] == "call"].set_index("strike")["mid"]
-    puts = q[q["type"] == "put"].set_index("strike")["mid"]
+    T = float(q["T"].iloc[0])
+    calls = q[q["type"] == "call"].groupby("strike")["mid"].mean()
+    puts = q[q["type"] == "put"].groupby("strike")["mid"].mean()
     common = calls.index.intersection(puts.index)
     common = common[np.abs(common / spot - 1.0) <= window]
     if len(common) < min_pairs:
         raise ValueError(f"only {len(common)} call/put pairs near the money; widen `window`")
     K = np.asarray(common, float)
     diff = calls.loc[common].to_numpy() - puts.loc[common].to_numpy()
-    slope, intercept = np.polyfit(K, diff, 1)
+
+    keep = np.ones(len(K), dtype=bool)
+    for _ in range(5):  # fit, drop outliers, refit until stable
+        slope, intercept = np.polyfit(K[keep], diff[keep], 1)
+        resid = diff - (slope * K + intercept)
+        centre = np.median(resid[keep])
+        spread = 1.4826 * np.median(np.abs(resid[keep] - centre))   # robust std
+        new_keep = np.abs(resid - centre) <= max(3.0 * spread, 0.01)
+        if new_keep.sum() < min_pairs or np.array_equal(new_keep, keep):
+            break
+        keep = new_keep
+    slope, intercept = np.polyfit(K[keep], diff[keep], 1)
+
     DF = -slope
-    if not 0.80 < DF <= 1.02:
-        raise ValueError(f"implausible discount factor {DF:.4f} from parity regression")
-    return intercept / DF, DF, len(common)
+    rate = -np.log(DF) / T if DF > 0 else np.inf
+    if rate_bounds[0] <= rate <= rate_bounds[1]:
+        return intercept / DF, DF, int(keep.sum())
+    if fallback_rate is None:
+        raise ValueError(f"parity regression implies an impossible {rate:.1%} interest rate")
+    DF = float(np.exp(-fallback_rate * T))
+    F = float(np.median(K[keep] + diff[keep] / DF))
+    return F, DF, int(keep.sum())
 
 
 def compute_smile(quotes, spot, window=0.06) -> pd.DataFrame:
-    """Implied vol for every out-of-the-money option, per expiry."""
-    results = []
-    for exp, grp in quotes.groupby("expiry", sort=False):
+    """Implied vol for every out-of-the-money option, per expiry.
+
+    Pass 1 reads F and DF from put-call parity for each expiry. Any expiry
+    whose parity slope implies an impossible interest rate is retried in pass 2
+    using the median rate implied by the expiries that passed (interest rates
+    barely differ across expiries a few months apart), so the expiry is kept
+    rather than dropped. Column `forward_method` records which pass was used.
+    """
+    groups = list(quotes.groupby("expiry", sort=False))
+    fits, retry = {}, []
+    for exp, grp in groups:
         try:
-            F, DF, n_pairs = estimate_forward(grp, spot, window)
+            fits[exp] = estimate_forward(grp, spot, window) + ("parity regression",)
         except ValueError as err:
-            warnings.warn(f"{exp}: skipped ({err})")
+            retry.append((exp, grp, err))
+
+    good_rates = [-np.log(DF) / float(g["T"].iloc[0]) for (e, g) in groups if e in fits
+                  for (_, DF, _, _) in [fits[e]]]
+    fallback = float(np.median(good_rates)) if good_rates else 0.04
+    for exp, grp, err in retry:
+        try:
+            fits[exp] = estimate_forward(grp, spot, window, fallback_rate=fallback) + ("parity at fallback rate",)
+            warnings.warn(f"{exp}: {err} (noisy quotes); used the {fallback:.2%} rate from the other "
+                          "expiries and read the forward from parity instead.")
+        except ValueError as err2:
+            warnings.warn(f"{exp}: skipped ({err2})")
+
+    results = []
+    for exp, grp in groups:
+        if exp not in fits:
             continue
+        F, DF, n_pairs, method = fits[exp]
         T = float(grp["T"].iloc[0])
         otm = grp[((grp["type"] == "put") & (grp["strike"] < F)) |
                   ((grp["type"] == "call") & (grp["strike"] >= F))].copy()
-        otm["F"], otm["DF"], otm["parity_pairs"] = F, DF, n_pairs
+        otm["F"], otm["DF"], otm["parity_pairs"], otm["forward_method"] = F, DF, n_pairs, method
         otm["k"] = np.log(otm["strike"] / F)
         otm["iv"] = [implied_vol_black76(p, F, K, T, DF, o)
                      for p, K, o in zip(otm["mid"], otm["strike"], otm["type"])]
