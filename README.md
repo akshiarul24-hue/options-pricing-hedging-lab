@@ -4,7 +4,7 @@ A from-scratch Python study of how options are priced, hedged and quoted:
 
 1. **Price** European options four independent ways (Black-Scholes closed form, Monte Carlo with variance reduction, a Crank-Nicolson PDE solver, a binomial tree) and verify they agree; price **American** options with the tree.
 2. **Hedge** a short option by Monte Carlo simulation of discrete delta hedging, measuring how the residual risk depends on rebalancing frequency, the stock's drift, the gap between implied and realized volatility, and transaction costs.
-3. **Quote**: back out the **implied volatility smile** from live SPY option prices, reading the forward and discount factor directly from put-call parity.
+3. **Quote**: back out the **implied volatility smile** from live SPY option prices, reading each expiry's forward from near-the-money put-call parity (the CBOE VIX method).
 
 Everything is implemented in plain NumPy/SciPy (no pricing libraries), checked by 73 passing unit tests, and explained step by step in three notebooks.
 
@@ -32,7 +32,7 @@ Everything is implemented in plain NumPy/SciPy (no pricing libraries), checked b
 | Gamma/theta attribution | -½Γ(ΔS)² + ½σ²S²Γ Δt explains **98.5%** of the variance of step-by-step hedged P&L |
 | Transaction costs (5 bp per trade) | Cost grows and risk shrinks with frequency; expected cost + 1 std is minimized around **126-252 rebalances** (2-4 per day) |
 
-**Implied volatility**: on synthetic quotes generated from a known smile (with bid-ask noise), the pipeline recovers every implied vol within **0.21 vol points** and the forward within 0.01%. The live SPY smile is produced by notebook 03.
+**Implied volatility**: on synthetic quotes generated from a known smile (with bid-ask noise), the pipeline recovers every implied vol within **0.22 vol points** and the forward within 0.02%. On live SPY quotes, the rate implied by the put-call-parity *slope* comes out biased (negative, shrinking like 1/T) because of American early exercise and stale in-the-money quotes, so the pipeline reads only the forward from parity and takes the rate from Treasury bills; a 1-point rate error moves implied vols by under 0.05 vol points. The live SPY smile is produced by notebook 03.
 
 ---
 
@@ -60,6 +60,10 @@ Everything is implemented in plain NumPy/SciPy (no pricing libraries), checked b
 ### Implied volatility pipeline validated on a known smile
 ![IV validation](figures/15_iv_pipeline_validation.png)
 
+<!-- After running notebook 03 in Colab, upload figures/16_iv_smile_SPY.png and remove these comment markers:
+### Live SPY implied volatility smile and term structure
+![SPY smile](figures/16_iv_smile_SPY.png)
+-->
 
 ---
 
@@ -105,7 +109,7 @@ jupyter lab notebooks/
 * **Crank-Nicolson** on x = ln S (constant coefficients), Dirichlet boundaries, 4 implicit Rannacher half-steps to damp the oscillations caused by the payoff kink; one tridiagonal (banded) solve per step.
 * **CRR binomial tree** with risk-neutral up-probability p = (e^{rΔt} - d)/(u - d); early-exercise check at every node for American options.
 * **Delta hedging** simulated path by path (vectorized over paths): self-financing cash account accruing at r, proportional transaction costs, optional hedge volatility different from pricing volatility.
-* **Implied vol**: forward F and discount factor DF from a regression of C - P on K (put-call parity), out-of-the-money options only, Black-76 inverted with Brent's method; quotes that violate no-arbitrage bounds return NaN.
+* **Implied vol**: forward F = K + (C - P)/DF from put-call parity, median over the 6 strikes nearest the money (CBOE VIX method), DF from a reference Treasury rate; the parity-regression rate is kept as a diagnostic; out-of-the-money options only; Black-76 inverted with Brent's method; quotes that violate no-arbitrage bounds return NaN.
 
 ## Limitations and next steps
 
