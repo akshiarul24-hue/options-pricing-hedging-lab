@@ -3,7 +3,8 @@ import numpy as np
 import pytest
 
 from optionslab import bs_price, bs_vega, derman_kamal_std, hedge_pnl_attribution, implied_vol, simulate_delta_hedge, simulate_gbm_paths
-from optionslab.market_data import clean_quotes, compute_smile, estimate_forward, make_synthetic_chain
+from optionslab.market_data import (clean_quotes, compute_smile, estimate_forward, make_synthetic_chain,
+                                    parity_regression_rate)
 
 S0, K, T, R, SIGMA = 100.0, 100.0, 0.25, 0.05, 0.20
 
@@ -37,39 +38,51 @@ def test_pipeline_recovers_known_smile():
     chain = make_synthetic_chain(spot=spot, r=r, q=q, seed=0)
     quotes = clean_quotes(chain)
     for _, grp in quotes.groupby("expiry"):
-        F, DF, _ = estimate_forward(grp, spot)
+        F, DF, _ = estimate_forward(grp, spot, rate=r)
         T_ = grp["T"].iloc[0]
         assert F == pytest.approx(spot * np.exp((r - q) * T_), abs=0.02)
-        assert DF == pytest.approx(np.exp(-r * T_), abs=0.002)
-    smile = compute_smile(quotes, spot)
+        assert DF == pytest.approx(np.exp(-r * T_), abs=1e-12)
+    smile = compute_smile(quotes, spot, rate=r)
     assert len(smile) > 50
     assert np.max(np.abs(smile["iv"] - smile["true_iv"])) < 0.005   # within half a vol point
 
-    # Robustness, on a realistic chain with $1 strikes:
+    # Realistic chain with $1 strikes, then the problems seen in free SPY data:
     spot = 585.0
     strikes = np.arange(500, 671, 1.0)
-    chain = make_synthetic_chain(spot=spot, r=r, q=q, expiries=(26 / 365, 61 / 365, 89 / 365),
+    chain = make_synthetic_chain(spot=spot, r=r, q=q, expiries=(26 / 365, 61 / 365, 89 / 365, 164 / 365),
                                  moneyness=strikes / spot, seed=3)
     quotes = clean_quotes(chain)
+    # On clean quotes the parity-regression diagnostic recovers the true rate
+    assert parity_regression_rate(quotes[quotes.expiry == "61d"], spot) == pytest.approx(r, abs=0.005)
+
+    # (a) stale quotes right at the money: the median over the nearest strikes ignores them
     T_short = 26 / 365
     F_true = spot * np.exp((r - q) * T_short)
-    # (a) a few stale call quotes near the money: outlier trimming keeps F and the rate right
     stale = quotes.copy()
-    stale.loc[(stale.expiry == "26d") & (stale.type == "call") & stale.strike.isin([596, 598, 600, 602, 604]), "mid"] += 1.2
-    F, DF, _ = estimate_forward(stale[stale.expiry == "26d"], spot)
-    assert F == pytest.approx(F_true, abs=0.05)
-    assert -np.log(DF) / T_short == pytest.approx(r, abs=0.01)
-    # (b) a systematic distortion (early-exercise premium on in-the-money puts) makes the parity
-    #     slope imply an impossible rate: the expiry must be kept using the other expiries' rate
+    stale.loc[(stale.expiry == "26d") & (stale.type == "call") & stale.strike.isin([586, 588]), "mid"] += 1.2
+    F, _, _ = estimate_forward(stale[stale.expiry == "26d"], spot, rate=r)
+    assert F == pytest.approx(F_true, abs=0.1)
+
+    # (b) systematic distortion of in-the-money quotes (early exercise of American puts, stale
+    #     wide calls) biases the parity slope into "impossible" negative rates that shrink like 1/T,
+    #     yet forwards and implied vols stay accurate
     distorted = quotes.copy()
-    itm_puts = (distorted.expiry == "26d") & (distorted.type == "put") & (distorted.strike > F_true)
-    distorted.loc[itm_puts, "mid"] += 0.025 * (distorted.loc[itm_puts, "strike"] - F_true)
-    with pytest.warns(UserWarning, match="impossible"):
-        smile = compute_smile(distorted, spot)
-    short = smile[smile.expiry == "26d"]
-    assert (short["forward_method"] == "parity at fallback rate").all()
-    assert short["F"].iloc[0] == pytest.approx(F_true, abs=0.15)
+    for exp, grp in distorted.groupby("expiry"):
+        F_e = spot * np.exp((r - q) * grp["T"].iloc[0])
+        puts = (distorted.expiry == exp) & (distorted.type == "put") & (distorted.strike > F_e)
+        calls = (distorted.expiry == exp) & (distorted.type == "call") & (distorted.strike < F_e)
+        distorted.loc[puts, "mid"] += 0.02 * (distorted.loc[puts, "strike"] - F_e)
+        distorted.loc[calls, "mid"] += 0.005 * (F_e - distorted.loc[calls, "strike"])
+    smile = compute_smile(distorted, spot, rate=r)
+    per_exp = smile.groupby("expiry", sort=False).agg(T=("T", "first"), F=("F", "first"),
+                                                       reg=("parity_regression_rate", "first")).sort_values("T")
+    assert per_exp["reg"].iloc[0] < 0 and per_exp["reg"].is_monotonic_increasing   # biased diagnostic
+    assert np.allclose(per_exp["F"], spot * np.exp((r - q) * per_exp["T"]), atol=0.15)
     assert np.max(np.abs(smile["iv"] - smile["true_iv"])) < 0.005
+
+    # (c) a reference rate that is off by 1.2 points barely moves the implied vols
+    off = compute_smile(quotes, spot, rate=r + 0.012)
+    assert np.max(np.abs(off["iv"] - off["true_iv"])) < 0.005
 
 
 def test_clean_quotes_drops_bad_rows():
