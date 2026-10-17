@@ -45,6 +45,32 @@ def test_pipeline_recovers_known_smile():
     assert len(smile) > 50
     assert np.max(np.abs(smile["iv"] - smile["true_iv"])) < 0.005   # within half a vol point
 
+    # Robustness, on a realistic chain with $1 strikes:
+    spot = 585.0
+    strikes = np.arange(500, 671, 1.0)
+    chain = make_synthetic_chain(spot=spot, r=r, q=q, expiries=(26 / 365, 61 / 365, 89 / 365),
+                                 moneyness=strikes / spot, seed=3)
+    quotes = clean_quotes(chain)
+    T_short = 26 / 365
+    F_true = spot * np.exp((r - q) * T_short)
+    # (a) a few stale call quotes near the money: outlier trimming keeps F and the rate right
+    stale = quotes.copy()
+    stale.loc[(stale.expiry == "26d") & (stale.type == "call") & stale.strike.isin([596, 598, 600, 602, 604]), "mid"] += 1.2
+    F, DF, _ = estimate_forward(stale[stale.expiry == "26d"], spot)
+    assert F == pytest.approx(F_true, abs=0.05)
+    assert -np.log(DF) / T_short == pytest.approx(r, abs=0.01)
+    # (b) a systematic distortion (early-exercise premium on in-the-money puts) makes the parity
+    #     slope imply an impossible rate: the expiry must be kept using the other expiries' rate
+    distorted = quotes.copy()
+    itm_puts = (distorted.expiry == "26d") & (distorted.type == "put") & (distorted.strike > F_true)
+    distorted.loc[itm_puts, "mid"] += 0.025 * (distorted.loc[itm_puts, "strike"] - F_true)
+    with pytest.warns(UserWarning, match="impossible"):
+        smile = compute_smile(distorted, spot)
+    short = smile[smile.expiry == "26d"]
+    assert (short["forward_method"] == "parity at fallback rate").all()
+    assert short["F"].iloc[0] == pytest.approx(F_true, abs=0.15)
+    assert np.max(np.abs(smile["iv"] - smile["true_iv"])) < 0.005
+
 
 def test_clean_quotes_drops_bad_rows():
     chain = make_synthetic_chain(seed=1)
