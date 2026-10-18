@@ -3,8 +3,9 @@ import numpy as np
 import pytest
 
 from optionslab import bs_price, bs_vega, derman_kamal_std, hedge_pnl_attribution, implied_vol, simulate_delta_hedge, simulate_gbm_paths
-from optionslab.market_data import (clean_quotes, compute_smile, estimate_forward, make_synthetic_chain,
-                                    parity_regression_rate)
+from optionslab.black_scholes import black76_price
+from optionslab.market_data import (clean_quotes, compute_smile, estimate_forward, flag_smile_outliers,
+                                    make_synthetic_chain, parity_regression_rate)
 
 S0, K, T, R, SIGMA = 100.0, 100.0, 0.25, 0.05, 0.20
 
@@ -83,6 +84,31 @@ def test_pipeline_recovers_known_smile():
     # (c) a reference rate that is off by 1.2 points barely moves the implied vols
     off = compute_smile(quotes, spot, rate=r + 0.012)
     assert np.max(np.abs(off["iv"] - off["true_iv"])) < 0.005
+
+
+def test_smile_spike_filter():
+    r, q, spot = 0.04, 0.012, 585.0
+    strikes = np.r_[np.arange(380, 530, 5.0), np.arange(530, 640, 1.0), np.arange(640, 705, 5.0)]
+    expiries = (33 / 365, 61 / 365, 89 / 365, 164 / 365)
+    # No false alarms on clean chains, including the steep, sparsely quoted far wings
+    for seed in range(5):
+        quotes = clean_quotes(make_synthetic_chain(spot=spot, r=r, q=q, expiries=expiries,
+                                                   moneyness=strikes / spot, seed=seed))
+        smile = compute_smile(quotes, spot, rate=r, drop_outliers=False)
+        for _, g in smile.groupby("expiry"):
+            assert not flag_smile_outliers(g["k"].to_numpy(), g["iv"].to_numpy()).any()
+    # Inject stale quotes like those seen on real long-dated SPY puts, including two adjacent ones
+    T = 164 / 365
+    F, DF = spot * np.exp((r - q) * T), np.exp(-r * T)
+    spikes = {455.0: 0.06, 460.0: 0.02, 490.0: 0.065, 505.0: 0.02}
+    for K_, bump in spikes.items():
+        m = (quotes.expiry == "164d") & (quotes.type == "put") & (quotes.strike == K_)
+        quotes.loc[m, "mid"] = float(black76_price(F, K_, T, DF, quotes.loc[m, "true_iv"].iloc[0] + bump, "put"))
+    with pytest.warns(UserWarning, match="removed 4 isolated"):
+        smile = compute_smile(quotes, spot, rate=r)
+    long_dated = smile[smile.expiry == "164d"]
+    assert not long_dated["strike"].isin(list(spikes)).any()
+    assert np.max(np.abs(smile["iv"] - smile["true_iv"])) < 0.005
 
 
 def test_clean_quotes_drops_bad_rows():
