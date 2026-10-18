@@ -60,6 +60,14 @@ Everything is implemented in plain NumPy/SciPy (no pricing libraries), checked b
 ### Implied volatility pipeline validated on a known smile
 ![IV validation](figures/15_iv_pipeline_validation.png)
 
+### Live SPY implied volatility smile and term structure (18 Oct 2026)
+![SPY smile](figures/16_iv_smile_SPY.png)
+
+Raw data behind this chart: [data/spy_smile_20261018.csv](data/spy_smile_20261018.csv)
+
+### Our implied vols vs Yahoo Finance's
+![IV vs Yahoo](figures/17_iv_vs_yahoo_SPY.png)
+
 
 ---
 
