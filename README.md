@@ -60,10 +60,6 @@ Everything is implemented in plain NumPy/SciPy (no pricing libraries), checked b
 ### Implied volatility pipeline validated on a known smile
 ![IV validation](figures/15_iv_pipeline_validation.png)
 
-<!-- After running notebook 03 in Colab, upload figures/16_iv_smile_SPY.png and remove these comment markers:
-### Live SPY implied volatility smile and term structure
-![SPY smile](figures/16_iv_smile_SPY.png)
--->
 
 ---
 
